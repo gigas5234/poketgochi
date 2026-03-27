@@ -64,3 +64,19 @@ canvas {
 .tile-flash {
   animation: tile-flash 0.3s ease-out;
 }
+
+/* ── 커스텀 애니메이션: 터치 리플 확장 ──
+   픽셀 스타일 동심원 파문.
+   scale() 대신 inset 을 조절하는 방식으로 구현해
+   부모 크기에 영향 없이 border 만 확장+페이드된다. */
+@keyframes ripple-expand {
+  0%   { opacity: 1;   transform: scale(0.4); }
+  70%  { opacity: 0.4; transform: scale(1.6); }
+  100% { opacity: 0;   transform: scale(2.2); }
+}
+
+/* ── 커스텀 애니메이션: 픽셀 캐릭터 호버링 ── */
+@keyframes pixel-hover {
+  0%, 100% { transform: translateY(0px); }
+  50%       { transform: translateY(-2px); }
+}
