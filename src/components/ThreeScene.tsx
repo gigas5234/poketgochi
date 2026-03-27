@@ -340,21 +340,33 @@ export default function ThreeScene() {
 
     animate();
 
-    // ── 9. ResizeObserver: 컨테이너 크기 변경 대응 ──
-    const resizeObserver = new ResizeObserver(() => {
-      const nw = mount.clientWidth;
-      const nh = mount.clientHeight;
+    // ── 9. 리사이즈 핸들러 ──
+    // 카메라 aspect ratio와 렌더러 크기를 동기화하는 단일 함수.
+    // ResizeObserver(컨테이너 기준)와 window resize(뷰포트 기준) 양쪽에 등록해
+    // PC↔모바일 전환, 브라우저 창 크기 변경, 주소창 출몰 등 모든 상황을 대응함.
+    function handleResize() {
+      const nw = mount!.clientWidth;
+      const nh = mount!.clientHeight;
       if (nw === 0 || nh === 0) return;
+      // 렌더러 해상도 업데이트
       renderer.setSize(nw, nh);
+      // 카메라 비율(Aspect Ratio) 업데이트 → 찌그러짐 방지
       camera.aspect = nw / nh;
       camera.updateProjectionMatrix();
-    });
+    }
+
+    // 컨테이너 크기 변화 감지 (PhoneFrame 내부 ↔ 풀스크린 전환 대응)
+    const resizeObserver = new ResizeObserver(handleResize);
     resizeObserver.observe(mount);
+
+    // 윈도우 뷰포트 크기 변화 감지 (창 크기 조절, 모바일 주소창 출몰 대응)
+    window.addEventListener("resize", handleResize);
 
     // ── 10. 클린업 ──
     return () => {
       cancelAnimationFrame(animId);
       resizeObserver.disconnect();
+      window.removeEventListener("resize", handleResize);
       window.removeEventListener("deviceorientation", handleOrientation, true);
       mount.removeEventListener("mousemove", handleMouseMove);
       renderer.dispose();
