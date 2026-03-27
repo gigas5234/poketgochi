@@ -4,75 +4,78 @@ import React, { useRef, useEffect } from "react";
 import PixelRoom from "./PixelRoom";
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  RoomContainer
-//  자이로스코프 데이터를 수신해 CSS 변수(--gx, --gy)로 변환하고,
-//  하위 PixelRoom 의 시차 레이어들이 이를 읽어 transform 을 적용한다.
+//  RoomContainer — 자이로 데이터를 CSS 변수로 변환하는 핵심 컨테이너
 //
 //  ── 데이터 흐름 ──
-//  DeviceOrientation Event
-//    → target.gx / target.gy (raw 값, 클램핑 처리)
-//      → requestAnimationFrame 루프에서 lerp(선형 보간)
-//        → el.style.setProperty('--gx', ...) / ('--gy', ...)
-//          → 자식 PixelRoom 의 CSS calc() 가 이 값을 곱해 transform 계산
+//  DeviceOrientationEvent
+//    → beta(Y) / gamma(X) 보정·클램핑
+//      → rAF 루프에서 Lerp(선형 보간)
+//        → --tilt-x / --tilt-y CSS 변수로 DOM 에 직접 쓰기
+//          → PixelRoom 각 레이어의 CSS calc() 가
+//            translate(calc(var(--tilt-x) * var(--depth)), ...) 계산
 //
-//  ── React 상태를 쓰지 않는 이유 ──
-//  setState 는 React 재렌더링을 트리거한다. 자이로 이벤트는 60fps 이상으로
-//  발생하므로 상태로 관리하면 매 프레임 컴포넌트 트리 전체가 재렌더링된다.
-//  CSS 변수를 직접 DOM 에 쓰면 React 사이클을 거치지 않고 GPU 에서
-//  transform 만 업데이트되므로 훨씬 효율적이다.
+//  ── Y축(beta) 미작동 원인 및 해결 ──
+//  문제: beta는 절대각(-180~180)이라 사람마다 폰 드는 각도가 달라
+//        (beta - 90) 방식은 초기값이 -20~-10 로 편향됨.
+//        그 상태에서 기울여도 클램프 범위를 벗어나 변화가 없어 보임.
+//  해결: 첫 이벤트의 beta를 기준(betaCalib)으로 저장하고
+//        이후 모든 delta = beta - betaCalib 로 계산.
+//        이렇게 하면 어떤 각도로 들든 항상 '현재 자세 = 0' 이 된다.
 //
-//  ── 마우스 폴백 ──
-//  데스크탑에서 자이로 없이도 마우스 이동으로 시차 효과를 테스트할 수 있다.
+//  ── CSS 변수 명세 ──
+//  --tilt-x : 좌우 기울기 (unitless 숫자, 예: 12.5)
+//  --tilt-y : 앞뒤 기울기 (unitless 숫자, 예: -7.3)
+//  --depth  : 각 레이어에서 개별 설정하는 px 단위 깊이값 (예: 1.5px)
+//             → calc(var(--tilt-x) * var(--depth)) = calc(12.5 * 1.5px) = 18.75px
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** 자이로 입력 클램프 범위 (±degree) — 이 범위 밖은 자르고 보간 */
-const GYRO_CLAMP = 22;
+/** 좌우(gamma) 클램프 범위 ±° — gamma 는 -90~90 넓은 범위라 넉넉하게 */
+const CLAMP_X = 20;
 
-/** Lerp 계수: 0.08 = 부드럽고 느린 추적, 0.15 = 빠른 반응 */
-const LERP_FACTOR = 0.08;
+/**
+ * 앞뒤(beta delta) 클램프 범위 ±°
+ * 실제로 폰을 들고 앞뒤로 기울이는 범위는 ±10~15° 정도.
+ * 좁게 설정해야 작은 기울기에도 민감하게 반응함.
+ */
+const CLAMP_Y = 12;
+
+/** Lerp 계수: 작을수록 부드럽고 느린 추적 */
+const LERP = 0.07;
 
 interface RoomContainerProps {
-  /** PocketGochi 에서 iOS 권한을 받은 후 true 로 전달 */
   gyroGranted: boolean;
 }
 
 export default function RoomContainer({ gyroGranted }: RoomContainerProps) {
-  // CSS 변수를 설정할 루트 DOM 엘리먼트
-  const containerRef = useRef<HTMLDivElement>(null);
-
-  // 자이로가 한 번이라도 활성화됐는지 추적 (마우스 폴백 비활성화에 사용)
+  const containerRef  = useRef<HTMLDivElement>(null);
   const gyroActiveRef = useRef(false);
 
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
 
-    // ── 목표값(raw input)과 현재값(smoothed) 분리 ──
-    // target: 이벤트에서 바로 덮어씀 (불연속 점프 가능)
-    // current: rAF 루프에서 target 으로 lerp (부드러운 이동)
-    const target  = { gx: 0, gy: 0 };
-    const current = { gx: 0, gy: 0 };
+    // 목표값(이벤트 raw) / 현재값(lerp 결과)
+    const target  = { tx: 0, ty: 0 };
+    const current = { tx: 0, ty: 0 };
 
-    // CSS 변수 초기화 (var(--gx, 0) fallback 이 있지만 명시적으로 설정)
-    el.style.setProperty("--gx", "0");
-    el.style.setProperty("--gy", "0");
+    // ── Y축 보정값 ──
+    // 첫 이벤트에서 beta를 저장해 이후 델타로 계산
+    // null = 아직 첫 이벤트 미수신
+    let betaCalib: number | null = null;
+
+    el.style.setProperty("--tilt-x", "0");
+    el.style.setProperty("--tilt-y", "0");
 
     // ─────────────────────────────────────
     //  rAF 루프: Lerp → CSS 변수 업데이트
-    //  매 프레임마다 현재값을 목표값 방향으로 조금씩 이동시켜
-    //  자이로/마우스 입력이 갑자기 변해도 카메라가 부드럽게 따라간다.
+    //  setState 없이 DOM 에 직접 쓰므로 React 재렌더링 없음.
     // ─────────────────────────────────────
     let animId: number;
-
     function loop() {
-      // 선형 보간: current += (target - current) * LERP_FACTOR
-      current.gx += (target.gx - current.gx) * LERP_FACTOR;
-      current.gy += (target.gy - current.gy) * LERP_FACTOR;
-
-      // 소수점 3자리까지만 전달 (불필요한 정밀도 제거)
-      el!.style.setProperty("--gx", current.gx.toFixed(3));
-      el!.style.setProperty("--gy", current.gy.toFixed(3));
-
+      current.tx += (target.tx - current.tx) * LERP;
+      current.ty += (target.ty - current.ty) * LERP;
+      el!.style.setProperty("--tilt-x", current.tx.toFixed(3));
+      el!.style.setProperty("--tilt-y", current.ty.toFixed(3));
       animId = requestAnimationFrame(loop);
     }
     loop();
@@ -80,79 +83,78 @@ export default function RoomContainer({ gyroGranted }: RoomContainerProps) {
     // ─────────────────────────────────────
     //  DeviceOrientation 핸들러
     //
-    //  gamma : 좌우 기울기, -90° ~ +90°
-    //          0° = 화면이 정면 / 양수 = 오른쪽으로 기울임
+    //  gamma: 좌우 기울기 (-90° ~ +90°)
+    //         폰을 수직으로 들면 0°에 가까움 → 그대로 사용
     //
-    //  beta  : 앞뒤 기울기, -180° ~ +180°
-    //          폰을 수직으로 세우면 beta ≈ 90°
-    //          따라서 (beta - 90) 을 정규화하면:
-    //            0  = 수직으로 세운 "평형" 상태
-    //           +값 = 앞쪽(화면이 위)으로 기울임
-    //           -값 = 뒤쪽(화면이 아래)으로 기울임
+    //  beta:  절대 기울기 (-180° ~ +180°)
+    //         ★ 핵심 수정: 첫 수신값을 보정값으로 저장 후 델타 계산
+    //         betaCalib = 사용자가 처음 폰을 든 각도 (자연스러운 자세)
+    //         rawTy = beta - betaCalib
+    //           → 0   = 최초 자세 (중립)
+    //           → +값 = 화면 위쪽이 멀어지는 방향으로 기울임
+    //           → -값 = 화면 위쪽이 가까워지는 방향으로 기울임
     // ─────────────────────────────────────
     function handleOrientation(e: DeviceOrientationEvent) {
+      const beta  = e.beta  ?? 90;
+      const gamma = e.gamma ?? 0;
+
+      // 최초 수신 시 보정값 저장 (이후 변경 없음)
+      if (betaCalib === null) {
+        betaCalib = beta;
+      }
+
       gyroActiveRef.current = true;
 
-      const rawGx =  (e.gamma ?? 0);
-      const rawGy =  (e.beta  ?? 90) - 90; // 수직 들기를 기준으로 정규화
+      // X축: gamma 직접 사용 (이미 0 중심)
+      target.tx = Math.max(-CLAMP_X, Math.min(CLAMP_X, gamma));
 
-      // 클램핑: 과도한 기울기는 잘라서 시차가 너무 커지지 않게 방지
-      target.gx = Math.max(-GYRO_CLAMP, Math.min(GYRO_CLAMP, rawGx));
-      target.gy = Math.max(-GYRO_CLAMP, Math.min(GYRO_CLAMP, rawGy));
+      // Y축: 보정된 델타값 사용
+      // CLAMP_Y 를 좁게 잡아 작은 기울기에도 민감하게 반응
+      target.ty = Math.max(-CLAMP_Y, Math.min(CLAMP_Y, beta - betaCalib));
     }
 
-    // iOS 에서는 권한을 받은 후에도 동일한 이벤트 이름 사용
     window.addEventListener("deviceorientation", handleOrientation, true);
 
     // ─────────────────────────────────────
-    //  마우스 이동 폴백 (데스크탑 테스트용)
-    //  자이로가 한 번도 수신되지 않았을 때만 작동.
-    //  마우스가 컨테이너 중앙 → gx=0, gy=0
-    //  마우스가 우측 끝 → gx=+20, 하단 → gy=+20
+    //  마우스 폴백 (데스크탑)
+    //  자이로 활성화 전까지만 작동.
+    //  마우스 중앙 → (0, 0), 끝 → (±CLAMP, ±CLAMP)
     // ─────────────────────────────────────
     function handleMouseMove(e: MouseEvent) {
-      if (gyroActiveRef.current) return; // 자이로 활성화 시 무시
+      if (gyroActiveRef.current) return;
       const rect = el!.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return;
-      // 0~1 정규화 후 ±20 범위로 스케일
-      const nx = (e.clientX - rect.left)  / rect.width;
-      const ny = (e.clientY - rect.top)   / rect.height;
-      target.gx = (nx - 0.5) * 40;
-      target.gy = (ny - 0.5) * 40;
+      if (!rect.width) return;
+      target.tx = ((e.clientX - rect.left) / rect.width  - 0.5) * (CLAMP_X * 2);
+      target.ty = ((e.clientY - rect.top)  / rect.height - 0.5) * (CLAMP_Y * 2);
     }
-    // window 에 등록: CeilingWindow 오버레이가 pointer-events 를 가로채도 작동
     window.addEventListener("mousemove", handleMouseMove);
 
     // ─────────────────────────────────────
-    //  터치 이동 폴백 (gyro 없는 환경의 모바일)
+    //  터치 드래그 폴백 (gyro 없는 환경)
     // ─────────────────────────────────────
     function handleTouchMove(e: TouchEvent) {
       if (gyroActiveRef.current) return;
-      const touch = e.touches[0];
+      const t    = e.touches[0];
       const rect = el!.getBoundingClientRect();
-      if (rect.width === 0) return;
-      target.gx = ((touch.clientX - rect.left)  / rect.width  - 0.5) * 36;
-      target.gy = ((touch.clientY - rect.top)   / rect.height - 0.5) * 36;
+      if (!rect.width) return;
+      target.tx = ((t.clientX - rect.left) / rect.width  - 0.5) * (CLAMP_X * 2);
+      target.ty = ((t.clientY - rect.top)  / rect.height - 0.5) * (CLAMP_Y * 2);
     }
     window.addEventListener("touchmove", handleTouchMove, { passive: true });
 
-    // ── 클린업 ──
     return () => {
       cancelAnimationFrame(animId);
       window.removeEventListener("deviceorientation", handleOrientation, true);
       window.removeEventListener("mousemove", handleMouseMove);
       window.removeEventListener("touchmove", handleTouchMove);
     };
-  }, [gyroGranted]); // gyroGranted 변경(iOS 권한) 시 재등록
+  }, [gyroGranted]);
 
   return (
-    // ref 를 통해 CSS 변수를 이 DOM 노드에 직접 설정.
-    // PixelRoom 이 이 노드의 하위이므로 CSS cascade 로 변수를 상속받는다.
-    <div
-      ref={containerRef}
-      className="absolute inset-0"
-      style={{ overflow: "hidden" }}
-    >
+    // --tilt-x / --tilt-y 를 이 노드에 설정.
+    // CSS custom property 는 하위 트리에 cascade 되므로
+    // PixelRoom 의 모든 레이어에서 var(--tilt-x), var(--tilt-y) 로 접근 가능.
+    <div ref={containerRef} className="absolute inset-0" style={{ overflow: "hidden" }}>
       <PixelRoom />
     </div>
   );
