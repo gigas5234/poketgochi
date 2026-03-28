@@ -74,37 +74,17 @@ const vertexShader = /* glsl */ `
 const fragmentShader = /* glsl */ `
   precision highp float;
 
-  uniform sampler2D uTexture;     // 원본 방 이미지 (컬러)
-  uniform sampler2D uDepthMap;    // 깊이맵 (greyscale: 흰=가까움, 검=멀음)
-  uniform vec2      uOffset;      // 현재 시차 오프셋 (UV 단위, 자이로/마우스 기반)
-  uniform vec2      uResolution;  // 캔버스 픽셀 크기 (width, height)
-  uniform float     uImageAspect; // 원본 이미지 종횡비 (width / height)
+  uniform sampler2D uTexture;  // 원본 방 이미지 (컬러)
+  uniform sampler2D uDepthMap; // 깊이맵 (greyscale: 흰=가까움, 검=멀음)
+  uniform vec2      uOffset;   // 현재 시차 오프셋 (UV 단위, 자이로/마우스 기반)
 
   varying vec2 vUv;
 
-  // ─────────────────────────────────────────────────────────────
-  //  coverUV: CSS object-fit:cover 와 동일한 UV 보정
-  //
-  //  PlaneGeometry 의 UV 는 화면 비율을 무시하고 항상 0→1.
-  //  이 함수로 이미지 비율을 유지하면서 화면을 꽉 채운다.
-  //
-  //  imageAspect / screenAspect = scale
-  //    scale > 1 → 이미지가 더 넓음 → 좌우 크롭
-  //    scale < 1 → 이미지가 더 높음 → 상하 크롭
-  // ─────────────────────────────────────────────────────────────
-  vec2 coverUV(vec2 uv) {
-    float screenAspect = uResolution.x / uResolution.y;
-    float scale = uImageAspect / screenAspect;
-    if (scale > 1.0) {
-      return vec2((uv.x - 0.5) * scale + 0.5, uv.y);
-    } else {
-      return vec2(uv.x, (uv.y - 0.5) / scale + 0.5);
-    }
-  }
-
   void main() {
-    // ── 1. object-fit:cover UV 보정 ──────────────────────────────
-    vec2 uv = coverUV(vUv);
+    // ── 1. UV ────────────────────────────────────────────────────
+    // PlaneGeometry 가 이미 이미지 원본 비율로 스케일됐으므로
+    // UV 보정 불필요 — vUv 를 그대로 사용 (왜곡 없음)
+    vec2 uv = vUv;
 
     // ── 2. 이 UV 위치의 깊이값 읽기 ──────────────────────────────
     //  depth = 1.0 → 카메라에 가장 가까운 픽셀 (예: 침대 위면)
@@ -190,17 +170,15 @@ function ParallaxMesh() {
   // ── Uniform 초기화 (텍스처 변경 시에만 재생성) ──
   const uniforms = useMemo(
     () => ({
-      uTexture:     { value: roomTex },
-      uDepthMap:    { value: depthTex },
-      uOffset:      { value: new THREE.Vector2(0, 0) },
-      uResolution:  { value: new THREE.Vector2(1, 1) },
-      uImageAspect: { value: imgAspect },
+      uTexture:  { value: roomTex },
+      uDepthMap: { value: depthTex },
+      uOffset:   { value: new THREE.Vector2(0, 0) },
     }),
-    [roomTex, depthTex, imgAspect],
+    [roomTex, depthTex],
   );
 
-  // ── 매 프레임: Lerp → Uniform 갱신 → 스케일 유지 ──
-  useFrame(({ size, viewport: vp }) => {
+  // ── 매 프레임: Lerp → Uniform 갱신 → 이미지 비율 유지 스케일 ──
+  useFrame(({ viewport: vp }) => {
     // 목표값으로 부드럽게 수렴 (지수 보간)
     cur.tx += (tilt.tx - cur.tx) * LERP;
     cur.ty += (tilt.ty - cur.ty) * LERP;
@@ -213,12 +191,24 @@ function ParallaxMesh() {
          (cur.tx / CLAMP_X) * MAX_OFFSET,
         -(cur.ty / CLAMP_Y) * MAX_OFFSET,
       );
-      u.uResolution.value.set(size.width, size.height);
     }
 
-    // viewport 크기(월드 좌표)에 맞게 평면 스케일 → 화면 항상 꽉 채움
+    // ── 이미지 원본 비율로 플레인 스케일 (contain 모드) ──
+    // 화면을 꽉 채우는 대신 이미지 비율을 정확히 유지.
+    // 빈 공간(검은 배경)은 Canvas 의 background 색상으로 채워짐.
     if (meshRef.current) {
-      meshRef.current.scale.set(vp.width, vp.height, 1);
+      const screenAspect = vp.width / vp.height;
+      let w: number, h: number;
+      if (imgAspect >= screenAspect) {
+        // 이미지가 화면보다 넓거나 같음 → 가로를 꽉 채우고 세로를 맞춤
+        w = vp.width;
+        h = vp.width / imgAspect;
+      } else {
+        // 이미지가 화면보다 높음 → 세로를 꽉 채우고 가로를 맞춤
+        h = vp.height;
+        w = vp.height * imgAspect;
+      }
+      meshRef.current.scale.set(w, h, 1);
     }
   });
 
