@@ -6,25 +6,23 @@ import dynamic from "next/dynamic";
 // ─────────────────────────────────────────────────────────────────
 //  RoomContainer
 //
-//  ThreeRoom(R3F Canvas)을 동적으로 로드한다.
-//  ssr: false — WebGL은 서버에서 실행 불가이므로 필수.
-//  loading: 로딩 중 배경색만 표시 (깜빡임 방지).
+//  ThreeRoom 은 WebGL(Canvas)을 포함하므로 SSR 불가.
+//  next/dynamic { ssr: false } 로 클라이언트에서만 로드.
+//
+//  ThreeRoom 이 자급자족(gyro 상태, HUD, 입력 이벤트 모두 내부 관리)
+//  이므로 props 전달 불필요.
 // ─────────────────────────────────────────────────────────────────
 const ThreeRoom = dynamic(() => import("./ThreeRoom"), {
   ssr: false,
   loading: () => (
-    <div style={{ width: "100%", height: "100%", background: "#0d0d0d" }} />
+    <div style={{ width: "100%", height: "100%", background: "#000000" }} />
   ),
 });
 
-interface RoomContainerProps {
-  gyroGranted: boolean;
-}
-
-export default function RoomContainer({ gyroGranted }: RoomContainerProps) {
+export default function RoomContainer() {
   return (
     <div className="absolute inset-0">
-      <ThreeRoom gyroGranted={gyroGranted} />
+      <ThreeRoom />
     </div>
   );
 }
