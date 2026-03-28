@@ -15,6 +15,11 @@
   box-sizing: border-box;
 }
 
+/* WebGL 캔버스는 브라우저 스케일링 품질 보존 (pixelated 제외) */
+canvas {
+  image-rendering: auto;
+}
+
 html,
 body {
   width: 100%;

@@ -1,178 +1,219 @@
 "use client";
 
-import React, { Suspense, useEffect } from "react";
+import React, { Component, Suspense, useEffect, useMemo, useRef } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import { useTexture } from "@react-three/drei";
 import * as THREE from "three";
 
 // ══════════════════════════════════════════════════════════════════
-//  에셋 경로 설정 — 여기만 수정하면 전체 적용됩니다
+//  에셋 경로 — 여기만 수정하면 전체 적용됩니다
 //
-//  depth map : 흰색(255) = 가장 높음 / 검정(0) = 가장 낮음
-//              grayscale PNG 권장 (RGBA 사용 시 R채널 기준)
+//  map      : 원본 실사 이미지 (JPEG/PNG)
+//  depthMap : 깊이맵 grayscale PNG  (흰=가까움 / 검=멀음)
+//
+//  현재: 00_room.png 와 floor.png 로 동작 확인용 기본값 설정.
+//  교체 시: map → "/asset/room.jpg", depthMap → "/asset/depth_map.png"
 // ══════════════════════════════════════════════════════════════════
-const ASSETS = {
-  floorMap:   "/asset/floor.png",
-  floorDepth: "/asset/floor.png",      // ← 교체: 바닥 깊이맵 grayscale PNG
-  bedMap:     "/asset/bed.png",
-  bedDepth:   "/asset/bed.png",        // ← 교체: 침대 깊이맵 grayscale PNG
+export const PARALLAX_ASSETS = {
+  map:      "/asset/00_room.png",    // ← 교체: 실사 방 이미지
+  depthMap: "/asset/floor.png",      // ← 교체: 깊이맵 grayscale PNG
 } as const;
 
-// ── 깊이 효과 조정 ──
-const FLOOR_DISPLACEMENT_SCALE = 0.45;  // 바닥 돌출 강도 (높을수록 입체)
-const FLOOR_DISPLACEMENT_BIAS  = -0.15; // 바닥 전체 오프셋 (음수=내려감)
-const BED_DISPLACEMENT_SCALE   = 0.30;  // 침대 돌출 강도
-const BED_DISPLACEMENT_BIAS    = 0.0;
+// ── 시차 강도 (숫자가 클수록 입체감 강함) ──
+// 0.03 = 미묘 / 0.06 = 권장 / 0.12 = 극적
+export const PARALLAX_STRENGTH = 0.06;
 
-// ── 카메라 기울기 ──
-const CLAMP_X = 20;   // gamma (좌우) 최대 ±°
-const CLAMP_Y = 12;   // beta delta (앞뒤) 최대 ±°
-const LERP    = 0.07; // 보간 계수 (작을수록 부드럽고 느림)
+// ── 자이로/마우스 클램핑 & 보간 ──
+const CLAMP_X = 20;
+const CLAMP_Y = 12;
+const LERP    = 0.07;
 
 // ── Singleton 틸트 상태 ──
-// React state 없이 module-level 객체로 관리 → re-render 제로
+// React state 대신 module-level 객체 → rAF 에서 re-render 없이 GPU 에 직접 전달
 const _tgt = { tx: 0, ty: 0 };
 const _cur = { tx: 0, ty: 0 };
 let _betaCalib: number | null = null;
 let _gyroActive               = false;
 
-// ─────────────────────────────────────────────────────────────────
-//  CameraRig
-//  gyro 틸트값 → 카메라 궤도 이동 → 가구 옆면이 드러나는 효과
-// ─────────────────────────────────────────────────────────────────
-function CameraRig() {
-  const { camera } = useThree();
+// ════════════════════════════════════════════════════════════════
+//  GLSL — Vertex Shader
+// ════════════════════════════════════════════════════════════════
+const vertexShader = /* glsl */ `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
 
-  useFrame(() => {
-    // Lerp: 현재값 → 목표값으로 부드럽게 수렴
+// ════════════════════════════════════════════════════════════════
+//  GLSL — Fragment Shader (Depth Parallax + Chromatic Aberration)
+//
+//  처리 순서:
+//  1. UV 보정     : object-fit:cover 와 동일하게 이미지 비율 맞춤
+//  2. 깊이 샘플   : depth map에서 픽셀 높이값 읽기
+//  3. 시차 오프셋 : 가까운 물체(depth=1)일수록 기울기 방향 반대로 이동
+//                  → 틸트 시 물체 옆면이 드러남
+//  4. 색수차      : R/G/B를 미세하게 다른 UV에서 샘플 (v0.dev 스타일)
+//  5. AO 근사     : 오목한 부분(낮은 depth)을 살짝 어둡게
+//  6. 경계 페이드 : 시차 경계 늘어남을 부드럽게 숨김
+// ════════════════════════════════════════════════════════════════
+const fragmentShader = /* glsl */ `
+  precision highp float;
+
+  uniform sampler2D uMap;        // 원본 이미지
+  uniform sampler2D uDepthMap;   // 깊이맵
+  uniform vec2      uTilt;       // 정규화 기울기 (-1 ~ +1, 좌우/앞뒤)
+  uniform float     uStrength;   // 시차 강도
+  uniform vec2      uResolution; // 캔버스 픽셀 크기 (width, height)
+  uniform float     uImgRatio;   // 이미지 종횡비 (width / height)
+
+  varying vec2 vUv;
+
+  void main() {
+    // ── 1. UV 보정 (object-fit: cover) ──────────────────────────
+    float screenRatio = uResolution.x / uResolution.y;
+    float scale       = uImgRatio / screenRatio;
+
+    vec2 uv = vUv;
+    if (scale > 1.0) {
+      // 이미지가 화면보다 넓음 → 좌우 크롭, 상하 꽉 채움
+      uv.x = (vUv.x - 0.5) * scale + 0.5;
+    } else {
+      // 이미지가 화면보다 좁음 → 상하 크롭, 좌우 꽉 채움
+      uv.y = (vUv.y - 0.5) / scale + 0.5;
+    }
+
+    // ── 2. 깊이 샘플 ─────────────────────────────────────────────
+    // depth: 0.0 = 가장 멀리 / 1.0 = 가장 가까이
+    float depth = texture2D(uDepthMap, uv).r;
+
+    // ── 3. 시차 오프셋 ────────────────────────────────────────────
+    // parallax = tilt * depth * strength
+    //   depth 가 클수록(가까울수록) 더 많이 이동
+    //   finalUV = uv - parallax  →  틸트 반대 방향으로 이동
+    //   → 기울이면 가까운 물체가 비켜나고 뒤(옆면)가 드러남
+    vec2 parallax = uTilt * depth * uStrength;
+    vec2 finalUV  = uv - parallax;
+
+    // ── 4. 색수차 (Chromatic Aberration) ─────────────────────────
+    // R 채널: 시차 방향으로 살짝 더 이동
+    // B 채널: 반대 방향으로 살짝 이동
+    // → 가까운 물체 엣지에서 미세한 색 분리 → 고급스러운 렌즈 효과
+    vec2 caShift = parallax * 0.18;
+    float r = texture2D(uMap, finalUV + caShift).r;
+    float g = texture2D(uMap, finalUV          ).g;
+    float b = texture2D(uMap, finalUV - caShift).b;
+
+    // ── 5. Ambient Occlusion 근사 ─────────────────────────────────
+    // depth 낮은 곳(오목 / 멀리) = 살짝 어둡게 → 실내 음영 표현
+    float ao    = 0.88 + 0.12 * depth;
+    vec3  color = vec3(r, g, b) * ao;
+
+    // ── 6. 경계 페이드 ────────────────────────────────────────────
+    // finalUV 가 0~1 밖으로 나가면 클램프 대신 알파를 0으로
+    // smoothstep 으로 부드럽게 페이드 → 테두리 늘어남 아티팩트 제거
+    vec2  edge = min(finalUV, 1.0 - finalUV);
+    float mask = smoothstep(0.0, 0.06, min(edge.x, edge.y));
+
+    gl_FragColor = vec4(color, mask);
+  }
+`;
+
+// ─────────────────────────────────────────────────────────────────
+//  ParallaxMesh — 셰이더 플레인 (화면 전체 채움)
+// ─────────────────────────────────────────────────────────────────
+function ParallaxMesh() {
+  const matRef  = useRef<THREE.ShaderMaterial>(null);
+  const meshRef = useRef<THREE.Mesh>(null);
+  const { viewport } = useThree();
+
+  const [mapTex, depthTex] = useTexture([
+    PARALLAX_ASSETS.map,
+    PARALLAX_ASSETS.depthMap,
+  ]);
+
+  // ── 고품질 필터링 설정 (image-rendering: pixelated 절대 금지) ──
+  useMemo(() => {
+    [mapTex, depthTex].forEach((t) => {
+      t.minFilter       = THREE.LinearMipmapLinearFilter;
+      t.magFilter       = THREE.LinearFilter;
+      t.generateMipmaps = true;
+      t.needsUpdate     = true;
+    });
+  }, [mapTex, depthTex]);
+
+  // ── 이미지 종횡비 자동 감지 ──
+  const imgRatio = useMemo(() => {
+    const img = mapTex.image as HTMLImageElement | undefined;
+    if (img?.naturalWidth && img.naturalHeight) {
+      return img.naturalWidth / img.naturalHeight;
+    }
+    return 4 / 3; // 폴백
+  }, [mapTex]);
+
+  // ── uniform 초기화 (텍스처 변경 시 재생성) ──
+  const uniforms = useMemo(
+    () => ({
+      uMap:        { value: mapTex },
+      uDepthMap:   { value: depthTex },
+      uTilt:       { value: new THREE.Vector2(0, 0) },
+      uStrength:   { value: PARALLAX_STRENGTH },
+      uResolution: { value: new THREE.Vector2(1, 1) }, // useFrame 에서 매 프레임 갱신
+      uImgRatio:   { value: imgRatio },
+    }),
+    [mapTex, depthTex, imgRatio],
+  );
+
+  // ── rAF 루프: 틸트 Lerp → uniform 갱신 → 메시 스케일 유지 ──
+  useFrame(({ size, viewport: vp }) => {
     _cur.tx += (_tgt.tx - _cur.tx) * LERP;
     _cur.ty += (_tgt.ty - _cur.ty) * LERP;
 
-    // 정규화된 기울기 (-1 ~ +1)
-    const nx = _cur.tx / CLAMP_X;
-    const ny = _cur.ty / CLAMP_Y;
+    if (matRef.current) {
+      const u = matRef.current.uniforms;
+      // 정규화 (-1~+1) 후 Y축 반전 (Three.js UV vs 화면 좌표계 차이)
+      u.uTilt.value.set(_cur.tx / CLAMP_X, -(_cur.ty / CLAMP_Y));
+      u.uResolution.value.set(size.width, size.height);
+    }
 
-    // 카메라가 중심 위에서 원호로 이동
-    const R = 3.2;            // 궤도 반경
-    const H = 3.8;            // 기본 높이
-    const rX = nx * 0.50;    // 좌우 회전각 (최대 ~28°)
-    const rY = ny * 0.28;    // 앞뒤 경사각 (최대 ~16°)
-
-    camera.position.x = Math.sin(rX) * R;
-    camera.position.z = Math.cos(rX) * R * 0.55 + rY * 1.4;
-    camera.position.y = H - Math.abs(ny) * 0.5;
-    camera.lookAt(0, 0.1, 0);
+    // viewport 세계 좌표 크기에 맞게 플레인 스케일 유지 (항상 화면 꽉 채움)
+    if (meshRef.current) {
+      meshRef.current.scale.set(vp.width, vp.height, 1);
+    }
   });
 
-  return null;
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  Floor
-//  4×4 unit 평면, 256×256 분할 → displacement 로 바닥 요철 표현
-// ─────────────────────────────────────────────────────────────────
-function Floor() {
-  const [colorTex, depthTex] = useTexture([ASSETS.floorMap, ASSETS.floorDepth]);
-
-  colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
-  depthTex.wrapS = depthTex.wrapT = THREE.ClampToEdgeWrapping;
-
   return (
-    <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
-      <planeGeometry args={[4, 4, 256, 256]} />
-      <meshStandardMaterial
-        map={colorTex}
-        displacementMap={depthTex}
-        displacementScale={FLOOR_DISPLACEMENT_SCALE}
-        displacementBias={FLOOR_DISPLACEMENT_BIAS}
-        roughness={0.88}
-        metalness={0.0}
-      />
-    </mesh>
-  );
-}
-
-// ─────────────────────────────────────────────────────────────────
-//  Bed
-//  투명 PNG를 바닥 위에 배치 + displacement 로 침대 두께 표현
-//  bed.png 실제 비율: 1137×546 ≈ 2.08 : 1
-// ─────────────────────────────────────────────────────────────────
-function Bed() {
-  const [colorTex, depthTex] = useTexture([ASSETS.bedMap, ASSETS.bedDepth]);
-
-  colorTex.wrapS = colorTex.wrapT = THREE.ClampToEdgeWrapping;
-  depthTex.wrapS = depthTex.wrapT = THREE.ClampToEdgeWrapping;
-
-  // 방 전체(4unit) 기준 침대 너비 약 55% = 2.2unit
-  const W = 2.2;
-  const H = W / (1137 / 546); // ≈ 1.057
-
-  return (
-    <mesh
-      rotation={[-Math.PI / 2, 0, 0]}
-      position={[0, 0.06, -0.65]}
-      castShadow
-    >
-      <planeGeometry args={[W, H, 128, 64]} />
-      <meshStandardMaterial
-        map={colorTex}
-        displacementMap={depthTex}
-        displacementScale={BED_DISPLACEMENT_SCALE}
-        displacementBias={BED_DISPLACEMENT_BIAS}
+    <mesh ref={meshRef} scale={[viewport.width, viewport.height, 1]}>
+      <planeGeometry args={[1, 1]} />
+      <shaderMaterial
+        ref={matRef}
+        vertexShader={vertexShader}
+        fragmentShader={fragmentShader}
+        uniforms={uniforms}
         transparent
-        alphaTest={0.15}
-        roughness={0.72}
-        metalness={0.0}
       />
     </mesh>
   );
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Scene — 조명 구성
-//  네온 색조 없이 자연스러운 백색광 → 텍스처 원색이 살아남
+//  TextureErrorBoundary — 텍스처 404 시 앱 크래시 방지
 // ─────────────────────────────────────────────────────────────────
-function Scene() {
-  return (
-    <>
-      {/* 전체 주변광 (부드러운 베이스) */}
-      <ambientLight intensity={1.0} color="#ffffff" />
-
-      {/* 위에서 내려오는 메인 조명 */}
-      <directionalLight
-        position={[1, 5, 2]}
-        intensity={1.8}
-        color="#fff8f0"
-        castShadow
-        shadow-mapSize={[1024, 1024]}
-        shadow-camera-near={0.5}
-        shadow-camera-far={20}
-        shadow-camera-left={-3}
-        shadow-camera-right={3}
-        shadow-camera-top={3}
-        shadow-camera-bottom={-3}
-      />
-
-      {/* 보조 역광 (오브젝트 윤곽 살리기) */}
-      <directionalLight
-        position={[-2, 3, -2]}
-        intensity={0.35}
-        color="#ddeeff"
-      />
-
-      <CameraRig />
-
-      {/* Suspense: 텍스처 로딩 중에는 아무것도 표시 안 함 */}
-      <Suspense fallback={null}>
-        <Floor />
-        <Bed />
-      </Suspense>
-    </>
-  );
+class TextureErrorBoundary extends Component<
+  { children: React.ReactNode },
+  { error: boolean }
+> {
+  state = { error: false };
+  static getDerivedStateFromError() { return { error: true }; }
+  render() {
+    if (this.state.error) return null; // 에셋 없으면 검은 배경만 표시
+    return this.props.children;
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  ThreeRoom — 최상위: Canvas + 이벤트 리스너 관리
+//  ThreeRoom — Canvas + 이벤트 리스너 (최상위)
 // ─────────────────────────────────────────────────────────────────
 interface ThreeRoomProps {
   gyroGranted: boolean;
@@ -180,16 +221,16 @@ interface ThreeRoomProps {
 
 export default function ThreeRoom({ gyroGranted }: ThreeRoomProps) {
   useEffect(() => {
-    // 마운트마다 보정값 초기화
     _betaCalib  = null;
     _gyroActive = false;
 
     if (!gyroGranted) return;
 
-    // ── DeviceOrientation (자이로) ──
+    // ── DeviceOrientation (자이로스코프) ──
     function onOrientation(e: DeviceOrientationEvent) {
       const beta  = e.beta  ?? 90;
       const gamma = e.gamma ?? 0;
+      // 첫 수신값을 기준으로 delta 계산 → 어떤 각도로 들든 항상 0이 중립
       if (_betaCalib === null) _betaCalib = beta;
       _gyroActive = true;
       _tgt.tx = Math.max(-CLAMP_X, Math.min(CLAMP_X, gamma));
@@ -223,12 +264,21 @@ export default function ThreeRoom({ gyroGranted }: ThreeRoomProps) {
 
   return (
     <Canvas
-      camera={{ position: [0, 3.8, 2.2], fov: 50, near: 0.1, far: 50 }}
+      camera={{ position: [0, 0, 5], fov: 50, near: 0.1, far: 20 }}
       gl={{ antialias: true, alpha: false }}
-      style={{ background: "#0d0d0d", display: "block", width: "100%", height: "100%" }}
-      shadows
+      style={{
+        display:         "block",
+        width:           "100%",
+        height:          "100%",
+        background:      "#000000",
+        imageRendering:  "auto", // globals.css 의 pixelated 덮어쓰기
+      }}
     >
-      <Scene />
+      <TextureErrorBoundary>
+        <Suspense fallback={null}>
+          <ParallaxMesh />
+        </Suspense>
+      </TextureErrorBoundary>
     </Canvas>
   );
 }
